@@ -7,7 +7,9 @@
         "dev": "tsx watch src/app.ts",
         "build": "tsc",
         "start": "node dist/app.js",
-        "typecheck": "tsc --noEmit"
+        "typecheck": "tsc --noEmit",
+        "test:api": "node test/api.test.js",
+        "test:curl": "test\\api-curl.bat"
     },
     "dependencies": {
         "dotenv": "^17.4.2",
