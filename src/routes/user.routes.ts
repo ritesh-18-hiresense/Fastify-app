@@ -1,7 +1,6 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { UserController } from '../controllers/user.controller.js';
 import { UserService } from '../services/user.service.js';
-import { UserRepository } from '../repositories/user.repository.js';
 import { CreateUserDto } from '../types/user.types.js';
 
 async function createUsersInTransaction(
@@ -16,8 +15,7 @@ async function createUsersInTransaction(
     }
 
     const result = await request.server.db.transaction(async (tx) => {
-        const txRepo = new UserRepository(tx);
-        const txService = new UserService(txRepo);
+        const txService = new UserService(tx);
 
         const created = [];
         for (const dto of users) {
@@ -32,8 +30,7 @@ async function createUsersInTransaction(
 }
 
 export async function userRoutes(fastify: FastifyInstance): Promise<void> {
-    const repo = new UserRepository(fastify.db);
-    const service = new UserService(repo);
+    const service = new UserService(fastify.db);
     const controller = new UserController(service);
 
     fastify.get('/users', controller.list.bind(controller));

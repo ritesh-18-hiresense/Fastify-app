@@ -1,4 +1,5 @@
-import { UserRepository } from '../repositories/user.repository.js';
+import { QueryRunner } from '../db/db.js';
+import { UserQueries } from '../queries/user.query.js';
 import { User, CreateUserDto, UpdateUserDto } from '../types/user.types.js';
 import { DuplicateKeyError } from '../errors/database.error.js';
 
@@ -17,10 +18,11 @@ export class EmailAlreadyTakenError extends Error {
 }
 
 export class UserService {
-    constructor(private readonly repo: UserRepository) {}
+    constructor(private readonly runner: QueryRunner) {}
 
     async findById(id: number): Promise<User> {
-        const user = await this.repo.findById(id);
+        const rows = await this.runner.query<User>(UserQueries.findById, [id]);
+        const user = rows[0] ?? null;
 
         if (!user) {
             throw new UserNotFoundError(id);
@@ -30,22 +32,24 @@ export class UserService {
     }
 
     async findByEmail(email: string): Promise<User | null> {
-        return this.repo.findByEmail(email);
+        const rows = await this.runner.query<User>(UserQueries.findByEmail, [email]);
+        return rows[0] ?? null;
     }
 
     async findAll(): Promise<User[]> {
-        return this.repo.findAll();
+        return this.runner.query<User>(UserQueries.findAll);
     }
 
     async create(dto: CreateUserDto): Promise<User> {
-        const existing = await this.repo.findByEmail(dto.email);
+        const existing = await this.findByEmail(dto.email);
 
         if (existing) {
             throw new EmailAlreadyTakenError(dto.email);
         }
 
         try {
-            return await this.repo.create(dto);
+            const rows = await this.runner.query<User>(UserQueries.create, [dto.name, dto.email]);
+            return rows[0];
         } catch (error) {
             if (error instanceof DuplicateKeyError) {
                 throw new EmailAlreadyTakenError(dto.email);
@@ -55,7 +59,8 @@ export class UserService {
     }
 
     async update(id: number, dto: UpdateUserDto): Promise<User> {
-        const user = await this.repo.update(id, dto);
+        const rows = await this.runner.query<User>(UserQueries.update, [id, dto.name ?? null, dto.email ?? null]);
+        const user = rows[0] ?? null;
 
         if (!user) {
             throw new UserNotFoundError(id);
@@ -65,7 +70,8 @@ export class UserService {
     }
 
     async delete(id: number): Promise<void> {
-        const deletedId = await this.repo.delete(id);
+        const rows = await this.runner.query<{ id: number }>(UserQueries.delete, [id]);
+        const deletedId = rows[0]?.id ?? null;
 
         if (deletedId === null) {
             throw new UserNotFoundError(id);
