@@ -1,0 +1,276 @@
+name: Deploy Backend to EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+
+      branch:
+        description: "Branch containing the commit"
+        required: true
+        type: string
+
+      commit_sha:
+        description: "Full Git commit SHA to deploy"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+
+    outputs:
+      short_sha: ${{ steps.commit.outputs.short_sha }}
+
+    steps:
+      - name: Show deployment request
+        run: |
+          echo "================================"
+          echo "Deployment request"
+          echo "================================"
+          echo "Environment : ${{ inputs.environment }}"
+          echo "Branch      : ${{ inputs.branch }}"
+          echo "Commit      : ${{ inputs.commit_sha }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "================================"
+
+      - name: Validate commit SHA format
+        shell: bash
+        run: |
+          SHA="${{ inputs.commit_sha }}"
+
+          if [[ ! "$SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "ERROR: Please provide the full 40-character commit SHA."
+            exit 1
+          fi
+
+      - name: Checkout repository history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate branch exists
+        shell: bash
+        run: |
+          BRANCH="${{ inputs.branch }}"
+
+          if ! git show-ref \
+            --verify \
+            --quiet \
+            "refs/remotes/origin/$BRANCH"; then
+
+            echo "ERROR: Branch '$BRANCH' does not exist."
+            exit 1
+          fi
+
+          echo "Branch exists: $BRANCH"
+
+      - name: Validate commit exists
+        shell: bash
+        run: |
+          SHA="${{ inputs.commit_sha }}"
+
+          if ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+            echo "ERROR: Commit '$SHA' does not exist."
+            exit 1
+          fi
+
+          echo "Commit exists: $SHA"
+
+      - name: Validate commit belongs to branch
+        shell: bash
+        run: |
+          SHA="${{ inputs.commit_sha }}"
+          BRANCH="${{ inputs.branch }}"
+
+          if ! git merge-base \
+            --is-ancestor \
+            "$SHA" \
+            "origin/$BRANCH"; then
+
+            echo "ERROR:"
+            echo "Commit $SHA does not belong to branch $BRANCH."
+            exit 1
+          fi
+
+          echo "Commit belongs to branch: $BRANCH"
+
+      - name: Create commit metadata
+        id: commit
+        shell: bash
+        run: |
+          SHA="${{ inputs.commit_sha }}"
+          SHORT_SHA="${SHA:0:7}"
+
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+
+  build:
+    name: Build ${{ inputs.commit_sha }}
+    needs: validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Verify checked-out commit
+        shell: bash
+        run: |
+          EXPECTED="${{ inputs.commit_sha }}"
+          ACTUAL="$(git rev-parse HEAD)"
+
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $ACTUAL"
+
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "ERROR: Checked-out commit does not match requested commit."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Create deployment package
+        shell: bash
+        run: |
+          tar \
+            --exclude=".git" \
+            --exclude="node_modules" \
+            -czf deployment.tar.gz \
+            .
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-${{ inputs.commit_sha }}
+          path: deployment.tar.gz
+          retention-days: 7
+
+
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    needs:
+      - validate
+      - build
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-${{ inputs.commit_sha }}
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload application to EC2
+        shell: bash
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          scp \
+            -i ~/.ssh/deploy_key \
+            deployment.tar.gz \
+            "$EC2_USER@$EC2_HOST:/tmp/deployment.tar.gz"
+
+      - name: Deploy application
+        shell: bash
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          APP_PATH: ${{ secrets.APP_PATH }}
+          PM2_APP_NAME: ${{ secrets.PM2_APP_NAME }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          ssh \
+            -i ~/.ssh/deploy_key \
+            "$EC2_USER@$EC2_HOST" \
+            "
+              set -e
+
+              RELEASE_PATH='$APP_PATH/releases/$COMMIT_SHA'
+
+              echo 'Creating release directory...'
+              mkdir -p \"\$RELEASE_PATH\"
+
+              echo 'Extracting application...'
+              tar -xzf /tmp/deployment.tar.gz \
+                -C \"\$RELEASE_PATH\"
+
+              cd \"\$RELEASE_PATH\"
+
+              echo 'Installing production dependencies...'
+              npm ci --omit=dev
+
+              echo 'Updating current release...'
+              ln -sfn \
+                \"\$RELEASE_PATH\" \
+                '$APP_PATH/current'
+
+              cd '$APP_PATH/current'
+
+              echo 'Restarting application...'
+              pm2 reload '$PM2_APP_NAME' --update-env
+
+              echo 'Saving PM2 configuration...'
+              pm2 save
+
+              echo 'Cleaning temporary files...'
+              rm -f /tmp/deployment.tar.gz
+
+              echo 'Deployment successful.'
+            "
+
+      - name: Deployment summary
+        shell: bash
+        run: |
+          echo "## Deployment Successful " >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Environment | ${{ inputs.environment }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | ${{ inputs.branch }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | ${{ inputs.commit_sha }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
